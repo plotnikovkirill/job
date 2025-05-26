@@ -1,46 +1,126 @@
 #include <iostream>
+#include <csignal>
+#include <chrono>
 #include <ctime>
-#include <unistd.h>
+#include <array>
+#include <arpa/inet.h>
 #include "SerialPort.h"
 
-int main() {
-    SerialPort serial("/dev/pts/8"); // Укажите свой порт
-    if (!serial.openPort()) {
-        std::cerr << "Failed to open port" << std::endl;
+volatile sig_atomic_t running = 1;
+
+#pragma pack(push, 1)
+struct TimePacket 
+{
+    uint32_t timestamp;
+    uint16_t crc16;
+};
+#pragma pack(pop)
+
+uint16_t crc16(const uint8_t* data, size_t len) 
+{
+    uint16_t crc = 0xFFFF;
+    for (size_t i = 0; i < len; ++i) 
+    {
+        crc ^= data[i];
+        for (int j = 0; j < 8; ++j) 
+        {
+            crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : crc >> 1;
+        }
+    }
+    return crc;
+}
+
+void signal_handler(int) 
+{
+    running = 0;
+}
+
+int main(int argc, char* argv[]) 
+{
+    if(argc != 3) 
+    {
+        std::cerr << "Usage: " << argv[0] << " <port> <baudrate>\n";
         return 1;
     }
 
-    while (true) {
-        time_t loopStart = time(nullptr); 
-        char request = 'T';
-        if (serial.writeData(&request, 1) != 1) {
-            std::cerr << "Write error" << std::endl;
-        }
+    signal(SIGINT, signal_handler);
 
-        char buffer[256]{};
-        int totalRead = 0;
-        time_t start = time(nullptr);
-        while (time(nullptr) - start < 0.5) {
-            int n = serial.readData(buffer + totalRead, sizeof(buffer) - totalRead - 1);
-            if (n > 0) {
-                totalRead += n;
+    try 
+    {
+        SerialPort serial(argv[1], std::stoi(argv[2]));
+        serial.open();
+
+        const uint8_t request = 'T';
+        TimePacket response;
+        std::array<uint8_t, sizeof(response)> buf;
+        size_t total = 0;
+
+        while(running) 
+        {
+            try 
+            {
+                serial.write(&request, 1);
             }
-            usleep(10000); // 10 ms между попытками чтения
-        }
+            catch(...) 
+            {
+                std::cerr << "Write failed, retrying...\n";
+                sleep(1);
+                continue;
+            }
 
-        if (totalRead > 0) {
-            buffer[totalRead] = '\0';
-            std::cout << "Server time: " << buffer << std::endl;
-        } else {
-            std::cout << "No response from server" << std::endl;
-        }
-        //Если цикл оказался больше секунды то сразу идем к следующему циклу
-        // иначе ждем оставшееся время до 1 секунды
-        time_t elapsed = time(nullptr) - loopStart;
-        if (elapsed < 1) {
-            sleep(1 - elapsed);
+            const auto start = std::chrono::steady_clock::now();
+            bool received = false;
+
+            while(running) {
+                const auto now = std::chrono::steady_clock::now();
+                
+                if(now - start > std::chrono::milliseconds(100)) break;
+                
+                try {
+                    const size_t bytes = serial.read(buf.data() + total,buf.size() - total);
+                    if(bytes > 0) 
+                    {
+                        total += bytes;
+                        if(total >= sizeof(response)) 
+                        {
+                            memcpy(&response, buf.data(), sizeof(response));
+                            const uint16_t crc = ntohs(response.crc16);
+                            const uint16_t calc_crc = crc16(
+                                reinterpret_cast<const uint8_t*>(&response.timestamp), 
+                                sizeof(response.timestamp)
+                            );
+                            response.timestamp = ntohl(response.timestamp);
+                            if(calc_crc == crc) {
+                                const time_t ts = response.timestamp;
+                                std::cout << "Time: " << ctime(&ts);
+                                received = true;
+                            }
+                            total = 0;
+                            break;
+                        }
+                    }
+                }
+                catch(...) 
+                {
+                    break;
+                }
+                usleep(1000);
+            }
+
+            if(!received) 
+            {
+                std::cout << "No valid response\n";
+            }
+
+            sleep(1);
         }
     }
+    catch(const std::exception& e) 
+    {
+        std::cerr << "Error: " << e.what() << '\n';
+        return 1;
+    }
 
+    std::cout << "Client stopped\n";
     return 0;
 }
